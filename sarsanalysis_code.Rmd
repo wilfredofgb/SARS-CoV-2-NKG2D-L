@@ -1,0 +1,278 @@
+---
+title: "SARS Respiratory Epithelial Cells Analysis"
+output: html_notebook
+---
+
+# Load Packages and Data Matrices
+
+```{r}
+# ensure Matrix <1.6.1.1 is loaded for compatibility with Seurat:
+library(Matrix, lib.loc = "~/4.2")
+library(Seurat)
+library(dplyr, lib.loc = "~/4.2")
+library(harmony, lib.loc = "~/4.2")
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+
+{r}
+# Load matrices.
+mtx <- as.matrix(read.table("~/sars_covid_nbt_main_data/gene_sorted-covid_nbt_main_expression_data.mtx", sep="\t"))
+
+sars_mtx <- readMM("~/sars_covid_nbt_main_data/gene_sorted-covid_nbt_main_expression_data.mtx")
+
+i_array <- sars_mtx@i + 1  
+j_array <- sars_mtx@j + 1  
+x_array <- sars_mtx@x
+cat("i:", head(i_array), "\n")
+cat("j:", head(j_array), "\n")
+cat("x:", head(x_array), "\n")
+max_row <- max(i_array)
+max_col <- max(j_array)
+cat("Max Row Index:", max_row, "\n")
+cat("Max Column Index:", max_col, "\n")
+sars_mtx <- sars_mtx[1:34545, 1:116313]
+
+# define names:
+sars_cellnames <- read.csv("~/sars_covid_nbt_main_data/covid_nbt_main_cellNames.csv")
+sars_genenames <- read.csv("~/sars_covid_nbt_main_data/covid_nbt_main_geneNames_upload.csv")
+rownames(sars_mtx) <- sars_genenames[,1]
+colnames(sars_mtx) <- sars_cellnames[,1]
+
+# load metadata:
+sars_metadata <- read.csv("~/sars_covid_nbt_main_data/covid_nbt_main_metaData.csv")
+rownames(sars_metadata) <- sars_metadata[,1]
+
+# create Seurat object:
+covid_nbt_main <- CreateSeuratObject(
+  sars_mtx,
+  project = "Project_1",
+  meta.data = sars_metadata)
+```
+
+# Analysis
+
+## Subsetting
+
+```{r}
+# include selected patients:
+selected_patients <- c("BIH-Con-02", "BIH-Con-03", "BIH-Con-04", "BIH-Con-05", "BIH-CoV-12", "BIH-CoV-07", "BIH-CoV-06", "BIH-CoV-16")
+subset <- subset(covid_nbt_main, subset = patient %in% selected_patients)
+```
+
+## Cell Cycle Regression
+
+```{r}
+# load gene sets for cell cycle scoring function:
+s_genes <- cc.genes$s.genes
+g2m_genes <- cc.genes$g2m.genes
+covid_nbt_main <- CellCycleScoring(covid_nbt_main, s_genes, g2m_genes)
+```
+
+## QC, Scaling, and Variable Feature Analysis
+
+```{r}
+# qc:
+covid_nbt_main[["percent.mito"]] <- PercentageFeatureSet(covid_nbt_main, pattern = "^MT")
+covid_nbt_main[["log10GenesPerUMI"]] <- log10(covid_nbt_main$nFeature_RNA) / log10(covid_nbt_main$nCount_RNA)
+
+# make subset of original object w/ qc metrics:
+covid_nbt_main <- subset(covid_nbt_main,
+                  subset = nCount_RNA > 500 & # RNA counts per cell cutoff
+                  nFeature_RNA > 200 & # genes expressed per cell cutoff
+                  log10GenesPerUMI > 0.8 &
+                  percent.mito < 5) # mitocondrial % per cell cutoff
+
+covid_nbt_main <- remove_low(covid_nbt_main) # remove low quality and low expressed genes
+```
+
+## Initial Analysis (PCA, UMAP, ETC. to define cell clusters)
+
+```{r}
+# complete PCA
+covid_nbt_main <- RunPCA(covid_nbt_main, features = VariableFeatures(object = covid_nbt_main))
+ElbowPlot(covid_nbt_main)
+
+# find # of significant PCs
+min.pc <- minpc_calc(covid_nbt_main)
+# 15
+options(repr.plot.height = 2.5, repr.plot.width = 6)
+covid_nbt_main <- RunHarmony(covid_nbt_main, "patient", plot_convergence = TRUE)
+
+# complete UMAP on harmony embeddings:
+covid_nbt_main <- covid_nbt_main %>% 
+    RunUMAP(reduction = "harmony", dims = 1:min.pc) %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:min.pc) %>% 
+    FindClusters(resolution = 0.2) # try 0.2 to 1.4
+
+# look @ UMAP:
+DimPlot(covid_nbt_main, reduction = "umap", label = T)
+options(bitmapType='cairo')
+
+# look at clusters and top 5 markers per cluster:
+markers <- FindAllMarkers(covid_nbt_main, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC) # make note of markers
+
+# compare to original annotations to confirm which clusters are epithelial cells:
+DimPlot(covid_nbt_main, reduction = "umap", group.by = "celltype" label = T)
+options(bitmapType='cairo')
+
+```
+
+# Epithelial Cells Analysis
+
+```{r}
+epithelial_final <- subset(covid_nbt_main, subset = celltype %in% c("Ciliated", "Ciliated-diff", "Squamous", "Secretory-diff", "Ionocyte", "Secretory", "Secretory-diff", "Ionocyte", "FOXN4", "IRC", "Basal", "unknown_epithelial"))
+```
+
+## QC, Scaling, and Variable Feature Analysis
+
+```{r}
+# Normalise and scale:
+epithelial_final <- process_object(epithelial_final)
+epithelial_final <- FindVariableFeatures(epithelial_final)
+
+# Scale data by all genes
+all_genes <- rownames(epithelial_final)
+epithelial_final <- ScaleData(epithelial_final, vars.to.regress = c("S.Score", "G2M.Score", "percent.mito"), features = all_genes)
+```
+
+## PCA
+
+```{r}
+# complete PCA:
+epithelial_final <- RunPCA(epithelial_final, features = VariableFeatures(object = epithelial_final))
+ElbowPlot(ciliated_cells) # elbow plot can be generated for assessing PCs
+
+# find # of significant PCs:
+min.pc <- minpc_calc(epithelial_final) # 15
+```
+
+## Harmony and UMAP
+
+```{r}
+# run harmony:
+options(repr.plot.height = 2.5, repr.plot.width = 6)
+epithelial_final <- RunHarmony(epithelial_final, "patient", plot_convergence = TRUE)
+
+# complete UMAP on harmony embeddings:
+epithelial_final <- epithelial_final %>% 
+    RunUMAP(reduction = "harmony", dims = 1:min.pc) %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:min.pc) %>% 
+    FindClusters(resolution = 0.3) # try resolutions 0.2 to 1.4
+
+# Check UMAP:
+umap <- DimPlot(epithelial_final, reduction = "umap", label = T)
+options(bitmapType='cairo')
+
+# Check cell annotations
+DimPlot(epithelial_final, reduction = "umap", group.by = "celltype", label = T, label.size = 0)
+options(bitmapType='cairo')
+```
+
+## Annotate Clusters
+
+```{r}
+markers <- FindAllMarkers(epithelial_final, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# displey top 5 by log2FC:
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+
+# remove non-epithelial clusters:
+epithelial_final <- subset(epithelial_final, subset = seurat_clusters %in% c(0, 1, 2, 3, 4, 7))
+
+# differential expression between clusters:
+gene_markers <- FindAllMarkers(epithelial_final, features = genes4analysis, min.pct = 0.1, logfc.threshold = 0.25)
+
+# create new seurat object to compare patient subsets:
+UIvsIpatient <- epithelial_final
+Idents(UIvsIpatient) <- UIvsIpatient$virus_pos
+# compare markers between patient subsets:
+select_markers <- FindAllMarkers(UIvsIpatient, min.pct = 0.1, logfc.threshold = 0.01, features = genes4analysis)
+markers <- FindMarkers(UIvsIpatient, features = genes4analysis, ident.1 = '1', ident.2 = '0', min.pct = 0.01, logfc.threshold = 0.01)
+markers <- FindMarkers(UIvsIpatient, ident.1 = "1", ident.2 = "0", min.pct = 0.1, logfc.threshold = 0.25)
+```
+
+# Figures
+
+UMAP
+
+```{r}
+DimPlot(epithelial_final, reduction = "umap", group.by = "new_cluster", label = T, label.size = 0) +
+labs(title = "Epithelial Cell Clusters")
+options(bitmapType='cairo')
+
+DimPlot(epithelial_final, reduction = "umap", group.by = "patient", label = T, label.size = 0) +
+labs(title = "Epithelial Cells by Sample")
+
+DimPlot(epithelial_final, reduction = "umap", group.by = "virus_pos", label = T, label.size = 0) +
+labs(title = "Epithelial Cells by COVID-19 Status")
+```
+
+## Dotplot
+
+```{r}
+# define new cluster names for visualisation:
+epithelial_final$new_cluster <- NA
+
+# rename clusters for graphing purposes:
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 0] <- "Basal"
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 1] <- "Secretory"
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 2] <- "Squamous"
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 3] <- "Ciliated"
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 4] <- "Ciliated"
+epithelial_final$new_cluster[epithelial_final$seurat_clusters == 7] <- "Deuterosomal"
+
+# create new objects to plot by patient subset
+epithelial_pos <- subset(epithelial_final, subset = virus_pos %in% c(1))
+epithelial_neg <- subset(epithelial_final, subset = virus_pos %in% c(0))
+
+plot1 <- DotPlot(epithelial_pos, features = genes4analysis, group.by = "new_cluster") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(axis.text.y = element_text(angle = 45, hjust = 1)) +
+  labs(title = "COVID-19+ Samples")
+
+plot2 <- DotPlot(epithelial_neg, features = genes4analysis, group.by = "new_cluster") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(axis.text.y = element_text(angle = 45, hjust = 1)) +
+  labs(title = "COVID-19- (Control) Samples")
+```
+
+## Cell Markers
+
+```{r}
+# define cluster markers
+cell_features <- c("NFIB", "TP63", "EPCAM", "FOXJ1", "MLF1", "LZTFL1", "FOXN4", "CCNO", "SEPTIN5", "SERPTINB5", "KRT5", "FOXA1", "VMO1", "MUC5AC", "SERPINB3", "TMSB4X", "KRT14")
+
+# create plot for cluster markers:
+DotPlot(epithelial_final, features = cell_features, group.by = "new_cluster") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(axis.text.y = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Epithelial Cell Marker Expression")
+
+dim_cells <- DoHeatmap(epithelial_final,
+  features = c("NFIB", "TP63", "EPCAM", "FOXJ1", "MLF1", "LZTFL1", "FOXN4", "CCNO", "SEPTIN5", "SERPTINB5", "KRT5", "FOXA1", "VMO1", "MUC5AC", "SERPINB3", "TMSB4X", "KRT14"),
+  group.by = "new_cluster")
+```
+
+## Cell % by Sample
+
+```{r}
+# make dataframe for cells % by patient:
+pts <- table(epithelial_final$new_cluster, epithelial_final$patient)
+pts <- as.data.frame(pts)
+pts$Var1 <- as.character(pts$Var1)
+colnames(pts) <- c("Cluster", "Patient", "Frequency")
+
+ggplot(pts, aes(x = Patient, y = Frequency, fill = Cluster)) +
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cell Type Proportion by Sample")
+```
